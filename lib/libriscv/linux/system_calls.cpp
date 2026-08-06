@@ -302,6 +302,16 @@ static void syscall_write(Machine<W>& machine)
 	const size_t len   = machine.sysarg(2);
 	SYSPRINT("SYSCALL write, fd: %d addr: 0x%lX, len: %zu\n",
 		vfd, (long)address, len);
+	// A zero-length write is a valid POSIX no-op, and the buffer pointer
+	// is never dereferenced in that case (glibc's buffered stdio does
+	// this as a harmless flush idiom, sometimes with a null pointer).
+	// gather_buffers_from_range() rejects any address below RWREAD_BEGIN
+	// (0x1000) regardless of len, which incorrectly turns this valid
+	// no-op into a protection fault. Handle it here first.
+	if (len == 0) {
+		machine.set_result(0);
+		return;
+	}
 	// Zero-copy retrieval of buffers
 	std::array<riscv::vBuffer, 64> buffers;
 
@@ -431,6 +441,61 @@ static void syscall_writev(Machine<W>& machine)
 } // writev
 
 template <int W>
+static void syscall_mkdirat(Machine<W>& machine)
+{
+	// Godot's own OS-layer needs a real mkdirat() to create its
+	// user://-mapped data directory. Confirmed missing entirely: Godot's
+	// make_dir_recursive fails with "Could not create directory" and the
+	// guest observes "Unhandled system call: 34" for this exact number,
+	// under a musl static build (see FINDINGS.md).
+	const int dir_fd = machine.template sysarg<int>(0);
+	const auto g_path = machine.sysarg(1);
+	const int mode = machine.template sysarg<int>(2);
+	std::string path = machine.memory.memstring(g_path);
+
+	SYSPRINT("SYSCALL mkdirat, dir_fd: %d path: %s mode: %o\n",
+		dir_fd, path.c_str(), mode);
+
+	if (machine.has_file_descriptors() && machine.fds().permit_filesystem) {
+		if (machine.fds().filter_open != nullptr) {
+			if (!machine.fds().filter_open(machine.template get_userdata<void>(), path)) {
+				machine.set_result(-EPERM);
+				return;
+			}
+		}
+		const int res = mkdirat(machine.fds().translate(dir_fd), path.c_str(), mode);
+		machine.set_result_or_error(res);
+		return;
+	}
+	machine.set_result(-EBADF);
+}
+
+template <int W>
+static void syscall_chdir(Machine<W>& machine)
+{
+	// See syscall_mkdirat above: confirmed missing entirely ("Unhandled
+	// system call: 49"), part of the same real gap blocking Godot's own
+	// data-directory setup under a musl static build.
+	const auto g_path = machine.sysarg(0);
+	std::string path = machine.memory.memstring(g_path);
+
+	SYSPRINT("SYSCALL chdir, path: %s\n", path.c_str());
+
+	if (machine.has_file_descriptors() && machine.fds().permit_filesystem) {
+		if (machine.fds().filter_open != nullptr) {
+			if (!machine.fds().filter_open(machine.template get_userdata<void>(), path)) {
+				machine.set_result(-EPERM);
+				return;
+			}
+		}
+		const int res = chdir(path.c_str());
+		machine.set_result_or_error(res);
+		return;
+	}
+	machine.set_result(-EBADF);
+}
+
+template <int W>
 static void syscall_openat(Machine<W>& machine)
 {
 	const int dir_fd = machine.template sysarg<int>(0);
@@ -537,6 +602,21 @@ static void syscall_dup3(Machine<W>& machine)
 }
 
 int create_pipe(int* pipes, int flags) {
+	// Force every guest pipe non-blocking. libriscv proxies pipe reads/
+	// writes directly to the real host pipe (see below), and this
+	// interpreter runs as a single host thread with cooperative guest
+	// "threads" time-sliced on it (see lib/libriscv/threads.hpp). A
+	// blocking read() on an empty pipe blocks that one host thread
+	// indefinitely, and since nothing else can ever run to service the
+	// write side while it is blocked, that block can never resolve on
+	// its own. Confirmed: a guest self-pipe pattern (two pipe2() calls,
+	// one fd closed, presumably from musl's own internal library code,
+	// not from Godot/Jolt's own source) hung this way under rvlinux.
+	// Forcing O_NONBLOCK turns an unresolvable indefinite host block
+	// into an EAGAIN the guest's own code must already be prepared to
+	// handle, since real Linux pipes can already return EAGAIN/EINTR
+	// under perfectly ordinary conditions.
+	flags |= O_NONBLOCK;
 	#if defined(__APPLE__)
 		// On macOS, we don't have pipe2, so we need to use pipe and then set the flags manually.
 		int res = pipe(pipes);
@@ -1225,6 +1305,8 @@ void Machine<W>::setup_linux_syscalls(bool filesystem, bool sockets)
 	install_syscall_handler(21, syscall_epoll_ctl<W>);
 	// epoll_pwait
 	install_syscall_handler(22, syscall_epoll_pwait<W>);
+	// mkdirat
+	install_syscall_handler(34, syscall_mkdirat<W>);
 	// dup
 	install_syscall_handler(23, syscall_dup<W>);
 	// dup3
@@ -1235,6 +1317,8 @@ void Machine<W>::setup_linux_syscalls(bool filesystem, bool sockets)
 	install_syscall_handler(29, syscall_ioctl<W>);
 	// faccessat
 	install_syscall_handler(48, syscall_faccessat<W>);
+	// chdir
+	install_syscall_handler(49, syscall_chdir<W>);
 
 	install_syscall_handler(56, syscall_openat<W>);
 	install_syscall_handler(57, syscall_close<W>);
@@ -1355,8 +1439,30 @@ void Machine<W>::setup_linux_syscalls(bool filesystem, bool sockets)
 	// msync
 	install_syscall_handler(227, syscall_stub_zero<W>);
 
-	// riscv_hwprobe
-	install_syscall_handler(258, syscall_stub_zero<W>);
+	// riscv_hwprobe: zero-fill each pair's `value` field (leaving `key`
+	// untouched), matching the real kernel ABI (struct riscv_hwprobe {
+	// int64_t key; uint64_t value; }; pairs are caller-allocated, keys
+	// are caller-filled, the kernel is expected to fill in `value`).
+	// The prior stub_zero left `value` as whatever guest stack garbage
+	// preceded the call, which glibc's memcpy IFUNC resolver then reads
+	// to pick a memcpy variant, causing non-deterministic crashes in
+	// larger binaries (confirmed: reproduced in a Godot-linked static
+	// binary calling String::num -> snprintf -> memcpy, not reproduced
+	// in a minimal snprintf-only binary with the same format string).
+	install_syscall_handler(258,
+	[] (Machine<W>& machine) {
+		const auto pairs = machine.template sysarg<address_type<W>>(0);
+		const auto pair_count = machine.template sysarg<address_type<W>>(1);
+		struct Pair { int64_t key; uint64_t value; };
+		for (address_type<W> i = 0; i < pair_count; i++) {
+			const address_type<W> addr = pairs + i * sizeof(Pair);
+			int64_t key = 0;
+			machine.copy_from_guest(&key, addr, sizeof(key));
+			Pair p{key, 0};
+			machine.copy_to_guest(addr, &p, sizeof(p));
+		}
+		machine.set_result(0);
+	});
 	// riscv_flush_icache
 	install_syscall_handler(259, syscall_stub_zero<W>);
 

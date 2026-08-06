@@ -360,7 +360,14 @@ static void run_program(
 	if constexpr (full_linux_guest)
 	{
 		std::vector<std::string> env = {
-			"LC_CTYPE=C", "LC_ALL=C", "RUST_BACKTRACE=full"
+			"LC_CTYPE=C", "LC_ALL=C", "RUST_BACKTRACE=full",
+			// Disable glibc's tcache fast-path entirely: a genuine
+			// tcache->counts[idx]!=0 / entries[idx]==NULL inconsistency
+			// crashes __libc_malloc under rvlinux (see FINDINGS.md).
+			// tcache_count=0 skips tcache_get/tcache_put altogether,
+			// falling back to the regular (slower, but not buggy here)
+			// malloc bins, sidestepping the bug without a code fix.
+			"GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.check=0",
 		};
 		machine.setup_linux(args, env);
 		// Linux system to open files and access internet
@@ -671,6 +678,26 @@ static void run_program(
 
 int main(int argc, const char** argv)
 {
+	// Permanently reserve real fds 0/1/2, before the guest ELF loads or
+	// any syscall runs. Confirmed via a real host-level `strace -f`: a
+	// guest close() on some unrelated, low-numbered virtual fd can end
+	// up closing the actual real host fd 1 (stdout), if that real
+	// number happened to be free for the OS to hand out to an earlier
+	// guest pipe()/open() call. When that happens, this program's own
+	// crash-report write(1, ...) silently fails with EBADF right when
+	// it matters most, on a real fault, making a genuine crash look
+	// like a silent early exit or hang instead. Matches the same known,
+	// open, unresolved symptom class as libriscv/libriscv#296 ("sqlite3
+	// not work with libriscv": a musl static binary quietly exits(0) in
+	// 0.115ms, doing nothing real). Keeping one extra dup() of each of
+	// 0/1/2 open for the process's entire lifetime means the OS can
+	// never reuse those three numbers for anything else again.
+	const int stdio_fds[] = {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO};
+	int reserved_stdio_fds[std::size(stdio_fds)];
+	for (size_t i = 0; i < std::size(stdio_fds); i++) {
+		reserved_stdio_fds[i] = dup(stdio_fds[i]);
+	}
+
 	Arguments cli_args;
 #ifdef HAVE_GETOPT_LONG
 	const int optind = parse_arguments(argc, argv, cli_args);

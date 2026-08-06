@@ -7,6 +7,14 @@
 #if defined(__APPLE__) || defined(__LINUX__)
 #include <errno.h>
 #endif
+// AT_FDCWD (used by translate() below) is standard POSIX, safe on any
+// non-Windows target unconditionally. The guard above uses __LINUX__,
+// which is not a real predefined macro (the real one is lowercase
+// __linux__), so it never actually fires on a real Linux build; fixing
+// that typo is out of scope here, so this include stays separate.
+#ifndef _WIN32
+#include <fcntl.h>
+#endif
 
 namespace riscv {
 
@@ -77,6 +85,14 @@ inline FileDescriptors::real_fd_type FileDescriptors::translate(int virtfd)
 {
 	auto it = translation.find(virtfd);
 	if (it != translation.end()) return it->second;
+	// AT_FDCWD is a special sentinel (-100), not a real fd needing
+	// translation: *at() syscalls (openat, mkdirat, ...) use it to mean
+	// "resolve this path relative to the current working directory."
+	// Passing it through unchanged only worked by coincidence before
+	// (an absolute guest path ignores dirfd entirely), and broke for
+	// real, relative-path callers like Godot's own directory setup,
+	// which received a real -1 instead, an outright invalid fd.
+	if (virtfd == AT_FDCWD) { return AT_FDCWD; }
 	// Only allow direct access to standard pipes and errors
 	return (virtfd >= 0 && virtfd <= 2) ? virtfd : -1;
 }
